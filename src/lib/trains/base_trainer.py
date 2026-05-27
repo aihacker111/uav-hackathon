@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import math
 import time
 import torch
 from progress.bar import Bar
@@ -94,13 +95,18 @@ class BaseTrainer(object):
         data_time, batch_time = AverageMeter(), AverageMeter()
         avg_loss_stats = {l: AverageMeter() for l in self.loss_stats}
         num_iters = len(data_loader) if opt.num_iters < 0 else opt.num_iters
-        bar = Bar('{}/{}'.format(opt.task, opt.exp_id), max=num_iters)
         end = time.time()
 
         # Gradient accumulation: effective_batch = batch_size × accum_steps
         # Weights are updated every accum_steps mini-batches (or at the very
         # last batch of the epoch so no gradients are silently dropped).
         accum_steps = max(1, getattr(opt, 'grad_accum', 1))
+
+        # Bar tracks optimizer steps, not mini-batches, so ETA / step count
+        # correctly reflects how many weight updates remain in this epoch.
+        num_opt_steps = math.ceil(num_iters / accum_steps)
+        bar = Bar('{}/{}'.format(opt.task, opt.exp_id), max=num_opt_steps)
+        opt_step = 0   # optimizer-step counter (used for bar display)
 
         if phase == 'train':
             self.optimizer.zero_grad()   # clear at epoch start
@@ -122,38 +128,43 @@ class BaseTrainer(object):
 
             # Backwards
             loss = loss.mean()
+
+            is_last_iter      = (batch_i + 1) >= num_iters
+            is_accum_boundary = (batch_i + 1) % accum_steps == 0
+            do_step           = (phase == 'train') and (is_accum_boundary or is_last_iter)
+
             if phase == 'train':
                 # Scale loss so gradient magnitude is independent of accum_steps
                 (loss / accum_steps).backward()
 
-                is_last_iter   = (batch_i + 1) >= num_iters
-                is_accum_boundary = (batch_i + 1) % accum_steps == 0
-
-                if is_accum_boundary or is_last_iter:
+                if do_step:
                     self.optimizer.step()   # update weights
                     self.optimizer.zero_grad()  # reset for next window
 
             batch_time.update(time.time() - end)
             end = time.time()
 
-            Bar.suffix = '{phase}: [{0}][{1}/{2}]|Tot: {total:} |ETA: {eta:} '.format(
-                epoch, batch_i, num_iters, phase=phase,
-                total=bar.elapsed_td, eta=bar.eta_td)
             for l in avg_loss_stats:
                 avg_loss_stats[l].update(loss_stats[l].mean().item(), batch['input'].size(0))
-                Bar.suffix = Bar.suffix + '|{} {:.4f} '.format(l, avg_loss_stats[l].avg)
 
-            # multi-scale img_size display
+            # Advance bar and update suffix only on optimizer steps (or every
+            # batch during val where accum_steps == 1).
+            if do_step or phase != 'train':
+                opt_step += 1
+                Bar.suffix = '{phase}: [{0}][{1}/{2}]|Tot: {total:} |ETA: {eta:} '.format(
+                    epoch, opt_step, num_opt_steps, phase=phase,
+                    total=bar.elapsed_td, eta=bar.eta_td)
+                for l in avg_loss_stats:
+                    Bar.suffix = Bar.suffix + '|{} {:.4f} '.format(l, avg_loss_stats[l].avg)
 
-
-            if not opt.hide_data_time:
-                Bar.suffix = Bar.suffix + '|Data {dt.val:.3f}s({dt.avg:.3f}s) ' \
-                                          '|Net {bt.avg:.3f}s'.format(dt=data_time, bt=batch_time)
-            if opt.print_iter > 0:
-                if batch_i % opt.print_iter == 0:
-                    print('{}/{}| {}'.format(opt.task, opt.exp_id, Bar.suffix))
-            else:
-                bar.next()
+                if not opt.hide_data_time:
+                    Bar.suffix = Bar.suffix + '|Data {dt.val:.3f}s({dt.avg:.3f}s) ' \
+                                              '|Net {bt.avg:.3f}s'.format(dt=data_time, bt=batch_time)
+                if opt.print_iter > 0:
+                    if opt_step % opt.print_iter == 0:
+                        print('{}/{}| {}'.format(opt.task, opt.exp_id, Bar.suffix))
+                else:
+                    bar.next()
 
             if opt.test:
                 self.save_result(output, batch, results)
