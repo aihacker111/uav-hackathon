@@ -18,6 +18,7 @@ from collections import OrderedDict, defaultdict
 # from cython_bbox import bbox_overlaps as bbox_ious
 # from lib.opts import opts
 from lib.utils.image import gaussian_radius, draw_umich_gaussian, draw_msra_gaussian
+from lib.datasets.uav_augment import apply_weather_light_color, bias_crop as _bias_crop
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
 
@@ -230,6 +231,12 @@ class LoadImagesAndLabels:  # for training
             img_hsv[:, :, 2] = V.astype(np.uint8)
             cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
 
+        # ── UAV augmentations: weather / lighting / color ─────────────────────
+        # Applied on the raw BGR image before letterbox so augments operate
+        # at full resolution without any padding artefacts.
+        if self.augment:
+            img = apply_weather_light_color(img, p=0.75)
+
         h, w, _ = img.shape
         img, ratio, pad_w, pad_h = letterbox(img, height=height, width=width)  # resizing and padding
 
@@ -247,6 +254,12 @@ class LoadImagesAndLabels:  # for training
                 labels[:, 5] = ratio * h * (labels_0[:, 3] + labels_0[:, 5] / 2) + pad_h  # y2
         else:
             labels = np.array([])
+
+        # ── Bias crop: zoom in on object-dense regions ────────────────────────
+        # Applied after letterbox + label conversion so both are in the same
+        # pixel coordinate system.  Fires ~50 % of the time during augment.
+        if self.augment and random.random() < 0.50:
+            img, labels = _bias_crop(img, labels)
 
         # Augment image and labels
         if self.augment:

@@ -124,6 +124,13 @@ class opts(object):
                                  type=int,
                                  default=8,  # 18, 16, 14, 12, 10, 8, 4
                                  help='batch size')
+        self.parser.add_argument('--grad_accum',
+                                 type=int,
+                                 default=1,
+                                 help='gradient accumulation steps. '
+                                      'Effective batch = batch_size × grad_accum. '
+                                      'Use to simulate larger batches without OOM. '
+                                      'E.g. --batch_size 4 --grad_accum 4 ≈ batch 16.')
 
         self.parser.add_argument('--master_batch_size', type=int, default=-1,
                                  help='batch size on the master gpu.')

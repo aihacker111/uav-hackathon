@@ -97,6 +97,14 @@ class BaseTrainer(object):
         bar = Bar('{}/{}'.format(opt.task, opt.exp_id), max=num_iters)
         end = time.time()
 
+        # Gradient accumulation: effective_batch = batch_size × accum_steps
+        # Weights are updated every accum_steps mini-batches (or at the very
+        # last batch of the epoch so no gradients are silently dropped).
+        accum_steps = max(1, getattr(opt, 'grad_accum', 1))
+
+        if phase == 'train':
+            self.optimizer.zero_grad()   # clear at epoch start
+
         # train each batch
         # print('Total {} batches in en epoch.'.format(len(data_loader) + 1))
         for batch_i, batch in enumerate(data_loader):
@@ -115,9 +123,15 @@ class BaseTrainer(object):
             # Backwards
             loss = loss.mean()
             if phase == 'train':
-                self.optimizer.zero_grad()  # 优化器梯度清零
-                loss.backward()  # 梯度反传
-                self.optimizer.step()  # 优化器依据反传的梯度, 更新网络权重
+                # Scale loss so gradient magnitude is independent of accum_steps
+                (loss / accum_steps).backward()
+
+                is_last_iter   = (batch_i + 1) >= num_iters
+                is_accum_boundary = (batch_i + 1) % accum_steps == 0
+
+                if is_accum_boundary or is_last_iter:
+                    self.optimizer.step()   # update weights
+                    self.optimizer.zero_grad()  # reset for next window
 
             batch_time.update(time.time() - end)
             end = time.time()

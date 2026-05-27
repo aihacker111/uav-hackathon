@@ -1,3 +1,4 @@
+albumentations>=2.0.0
 yacs
 opencv-python
 PyYAML
