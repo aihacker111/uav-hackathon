@@ -39,7 +39,15 @@ def run(opt):
     f.close()
 
     # Image data transformations
-    transforms = T.Compose([T.ToTensor()])
+    # ToTensor: HxWxC uint8 [0,255] → CxHxW float32 [0,1]
+    # Normalize: re-centre to ImageNet stats that DEIMv2/ViT backbones expect.
+    #   mean/std from ImageNet: required when loading DINOv3 / ViT pretrained weights.
+    #   If you train from scratch (no pretrained backbone), you can remove Normalize.
+    transforms = T.Compose([
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),
+    ])
 
     # Dataset
     dataset = Dataset(opt=opt,
