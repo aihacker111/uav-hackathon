@@ -8,17 +8,13 @@ import time
 import warnings
 
 import cv2
-# import json
 import numpy as np
+import PIL.Image
 import torch
 
 from collections import OrderedDict, defaultdict
-# from torch.utils.data import Dataset
-# from torchvision.transforms import transforms as T
-# from cython_bbox import bbox_overlaps as bbox_ious
-# from lib.opts import opts
 from lib.utils.image import gaussian_radius, draw_umich_gaussian, draw_msra_gaussian
-from lib.datasets.uav_augment import apply_weather_light_color, bias_crop as _bias_crop
+from lib.datasets.uav_augment import build_aerial_mot_transforms
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
 
@@ -79,7 +75,6 @@ class LoadImages:
         img /= 255.0
         img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
 
-        # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
         return img_path, img, img_0
 
     def __getitem__(self, idx):
@@ -123,7 +118,7 @@ class LoadVideo:  # for inference
         self.height = img_size[1]
         self.count = 0
 
-        self.w, self.h = 1920, 1080  # 设置(输出的分辨率)
+        self.w, self.h = 1920, 1080
         print('Lenth of the video: {:d} frames'.format(self.vn))
 
     def get_size(self, vw, vh, dw, dh):
@@ -154,8 +149,6 @@ class LoadVideo:  # for inference
         img /= 255.0
         img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
 
-        # save letterbox image
-        # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])
         return self.count, img, img_0
 
     def __len__(self):
@@ -192,6 +185,10 @@ class LoadImagesAndLabels:  # for training
         self.augment = augment
         self.transforms = transforms
 
+        # PIL augmentation pipeline (pre-letterbox).  None during inference.
+        # Replaces apply_weather_light_color + bias_crop + random_affine.
+        self._pil_aug = build_aerial_mot_transforms() if augment else None
+
     def __getitem__(self, files_index):
         img_path = self.img_files[files_index]
         label_path = self.label_files[files_index]
@@ -199,82 +196,115 @@ class LoadImagesAndLabels:  # for training
 
     def get_data(self, img_path, label_path, width=None, height=None):
         """
-        图像数据格式转换, 增强; 标签格式化
-        :param img_path:
-        :param label_path:
-        :param height:
-        :param width:
-        :return:
+        Image data format conversion + augmentation; label formatting.
+
+        Augmentation path (self.augment=True):
+          1. Load raw BGR image.
+          2. Load raw labels (norm. xywh) and convert to pixel xyxy of original image.
+          3. Apply PIL augmentation pipeline (geometric + appearance, pre-letterbox).
+             Pipeline includes: RandomHorizontalFlip, ScaleBiasedCrop,
+             RandomPerspective, ColorJitter, NightMode/Fog/Glare (OneOf),
+             MotionBlur/GaussianBlur (OneOf), JPEG compression, sensor noise,
+             occlusion patches, multi-scale resize.
+          4. Letterbox the augmented image to final network resolution.
+          5. Re-map augmented boxes to letterbox pixel coords.
+          6. Convert xyxy → normalised cxcywh.
+
+        Inference path (self.augment=False):
+          Standard letterbox + label coord conversion; no augmentation.
+
+        :param img_path:   path to input image
+        :param label_path: path to label .txt (normalised xywh, 6 columns)
+        :param height:     target network height  (default: self.height)
+        :param width:      target network width   (default: self.width)
+        :return:           img (C×H×W tensor), labels (N×6), img_path, (h_orig, w_orig)
         """
-        # 输入网络的图像分辨率
         if height is None or width is None:
             height = self.height
             width = self.width
 
-        # 读取图片数据为numpy array格式, 3通道顺序为BGR
-        img = cv2.imread(img_path)  # cv(numpy): BGR
+        # Read raw image (BGR numpy)
+        img = cv2.imread(img_path)
         if img is None:
             raise ValueError('File corrupt {}'.format(img_path))
 
-        augment_hsv = True
-        if self.augment and augment_hsv:
-            # SV augmentation by 50%
-            fraction = 0.50
-            img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            S = img_hsv[:, :, 1].astype(np.float32)
-            V = img_hsv[:, :, 2].astype(np.float32)
+        h_orig, w_orig = img.shape[:2]  # original dims — returned to caller
 
-            a = (random.random() * 2 - 1) * fraction + 1
-            S *= a
-            if a > 1:
-                np.clip(S, a_min=0, a_max=255, out=S)
+        # ── Augmentation path ─────────────────────────────────────────────────
+        if self.augment and self._pil_aug is not None:
 
-            a = (random.random() * 2 - 1) * fraction + 1
-            V *= a
-            if a > 1:
-                np.clip(V, a_min=0, a_max=255, out=V)
+            # Load raw labels (normalised xywh, cols: cls_id track_id cx cy bw bh)
+            if os.path.isfile(label_path):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    labels_0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
+            else:
+                labels_0 = np.zeros((0, 6), dtype=np.float32)
 
-            img_hsv[:, :, 1] = S.astype(np.uint8)
-            img_hsv[:, :, 2] = V.astype(np.uint8)
-            cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
+            # Convert normalised xywh → pixel xyxy in original image space
+            if len(labels_0) > 0:
+                boxes = np.stack([
+                    (labels_0[:, 2] - labels_0[:, 4] / 2) * w_orig,  # x1
+                    (labels_0[:, 3] - labels_0[:, 5] / 2) * h_orig,  # y1
+                    (labels_0[:, 2] + labels_0[:, 4] / 2) * w_orig,  # x2
+                    (labels_0[:, 3] + labels_0[:, 5] / 2) * h_orig,  # y2
+                ], axis=1).astype(np.float32)
+                target_dict = {
+                    "boxes":  torch.from_numpy(boxes),
+                    "labels": torch.from_numpy(labels_0[:, 0].astype(np.int64)),
+                    "ids":    torch.from_numpy(labels_0[:, 1].astype(np.int64)),
+                    "size":   torch.tensor([h_orig, w_orig]),
+                }
+            else:
+                target_dict = {
+                    "boxes":  torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros(0, dtype=torch.int64),
+                    "ids":    torch.zeros(0, dtype=torch.int64),
+                    "size":   torch.tensor([h_orig, w_orig]),
+                }
 
-        # ── UAV augmentations: weather / lighting / color ─────────────────────
-        # Applied on the raw BGR image before letterbox so augments operate
-        # at full resolution without any padding artefacts.
-        if self.augment:
-            img = apply_weather_light_color(img, p=0.75)
+            # Apply PIL augmentation pipeline (BGR → RGB PIL → augment → BGR numpy)
+            pil_img = PIL.Image.fromarray(img[:, :, ::-1])
+            pil_img, target_dict = self._pil_aug(pil_img, target_dict)
+            img = np.array(pil_img)[:, :, ::-1].copy()  # RGB PIL → BGR numpy
 
-        h, w, _ = img.shape
-        img, ratio, pad_w, pad_h = letterbox(img, height=height, width=width)  # resizing and padding
+            # Letterbox the augmented image to final network resolution
+            img, ratio, pad_w, pad_h = letterbox(img, height=height, width=width)
 
-        # Load labels
-        if os.path.isfile(label_path):
-            with warnings.catch_warnings():  # No warnings for empty label file(txt)
-                warnings.simplefilter("ignore")
-                labels_0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
+            # Re-map augmented boxes to letterbox pixel coordinates
+            aug_boxes = target_dict["boxes"].numpy()
+            if len(aug_boxes) > 0:
+                labels = np.zeros((len(aug_boxes), 6), dtype=np.float32)
+                labels[:, 0] = target_dict["labels"].numpy()
+                labels[:, 1] = target_dict["ids"].numpy()
+                labels[:, 2] = np.clip(aug_boxes[:, 0] * ratio + pad_w, 0, width)   # x1
+                labels[:, 3] = np.clip(aug_boxes[:, 1] * ratio + pad_h, 0, height)  # y1
+                labels[:, 4] = np.clip(aug_boxes[:, 2] * ratio + pad_w, 0, width)   # x2
+                labels[:, 5] = np.clip(aug_boxes[:, 3] * ratio + pad_h, 0, height)  # y2
+                # Drop degenerate boxes produced by aggressive crops/perspective
+                keep = (labels[:, 4] - labels[:, 2] > 2) & (labels[:, 5] - labels[:, 3] > 2)
+                labels = labels[keep]
+            else:
+                labels = np.array([])
 
-                # reformat xywh to pixel xyxy(x1, y1, x2, y2) format
-                labels = labels_0.copy()  # deep copy
-                labels[:, 2] = ratio * w * (labels_0[:, 2] - labels_0[:, 4] / 2) + pad_w  # x1
-                labels[:, 3] = ratio * h * (labels_0[:, 3] - labels_0[:, 5] / 2) + pad_h  # y1
-                labels[:, 4] = ratio * w * (labels_0[:, 2] + labels_0[:, 4] / 2) + pad_w  # x2
-                labels[:, 5] = ratio * h * (labels_0[:, 3] + labels_0[:, 5] / 2) + pad_h  # y2
+        # ── Inference / no-augmentation path ──────────────────────────────────
         else:
-            labels = np.array([])
+            img, ratio, pad_w, pad_h = letterbox(img, height=height, width=width)
 
-        # ── Bias crop: zoom in on object-dense regions ────────────────────────
-        # Applied after letterbox + label conversion so both are in the same
-        # pixel coordinate system.  Fires ~50 % of the time during augment.
-        if self.augment and random.random() < 0.50:
-            img, labels = _bias_crop(img, labels)
+            if os.path.isfile(label_path):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    labels_0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 6)
 
-        # Augment image and labels
-        if self.augment:
-            img, labels, M = random_affine(img, labels,
-                                           degrees=(-5, 5),
-                                           translate=(0.10, 0.10),
-                                           scale=(0.50, 1.20))
+                labels = labels_0.copy()
+                labels[:, 2] = ratio * w_orig * (labels_0[:, 2] - labels_0[:, 4] / 2) + pad_w  # x1
+                labels[:, 3] = ratio * h_orig * (labels_0[:, 3] - labels_0[:, 5] / 2) + pad_h  # y1
+                labels[:, 4] = ratio * w_orig * (labels_0[:, 2] + labels_0[:, 4] / 2) + pad_w  # x2
+                labels[:, 5] = ratio * h_orig * (labels_0[:, 3] + labels_0[:, 5] / 2) + pad_h  # y2
+            else:
+                labels = np.array([])
 
+        # ── Debug visualisation (disabled by default) ─────────────────────────
         plot_flag = False
         if plot_flag:
             import matplotlib
@@ -282,36 +312,31 @@ class LoadImagesAndLabels:  # for training
             import matplotlib.pyplot as plt
             plt.figure(figsize=(50, 50))
             plt.imshow(img[:, :, ::-1])
-            plt.plot(labels[:, [2, 4, 4, 2, 2]].T,
-                     labels[:, [3, 3, 5, 5, 3]].T, '.-')
+            if len(labels) > 0:
+                plt.plot(labels[:, [2, 4, 4, 2, 2]].T,
+                         labels[:, [3, 3, 5, 5, 3]].T, '.-')
             plt.axis('off')
             plt.savefig('test.jpg')
             time.sleep(10)
 
+        # ── Convert xyxy → normalised cxcywh ──────────────────────────────────
         num_labels = len(labels)
         if num_labels > 0:
-            # convert xyxy to xywh(center_x, center_y, b_w, b_h)
             labels[:, 2:6] = xyxy2xywh(labels[:, 2:6].copy())
-
-            # normalize to 0~1
             labels[:, 2] /= width
             labels[:, 3] /= height
             labels[:, 4] /= width
             labels[:, 5] /= height
-        if self.augment:
-            # random left-right flip
-            lr_flip = True
-            if lr_flip & (random.random() > 0.5):
-                img = np.fliplr(img)
-                if num_labels > 0:
-                    labels[:, 2] = 1 - labels[:, 2]
 
+        # ── BGR → RGB, apply tensor transforms ────────────────────────────────
+        # Note: RandomHorizontalFlip is already part of the PIL pipeline above;
+        # the standalone lr_flip block has been removed to avoid double-flipping.
         img = np.ascontiguousarray(img[:, :, ::-1])  # BGR to RGB
 
         if self.transforms is not None:
             img = self.transforms(img)
 
-        return img, labels, img_path, (h, w)
+        return img, labels, img_path, (h_orig, w_orig)
 
     def __len__(self):
         return self.nF  # number of batches
@@ -362,7 +387,6 @@ def random_affine(img, targets=None,
     # Rotation and Scale
     R = np.eye(3)
     a = random.random() * (degrees[1] - degrees[0]) + degrees[0]
-    # a += random.choice([-180, -90, 0, 90])  # 90deg rotations added to small rotations
     s = random.random() * (scale[1] - scale[0]) + scale[0]
     R[:2] = cv2.getRotationMatrix2D(angle=a, center=(
         img.shape[1] / 2, img.shape[0] / 2), scale=s)
@@ -452,7 +476,6 @@ def collate_fn(batch):
     return imgs, filled_labels, paths, sizes, labels_len.unsqueeze(1)
 
 
-
 # ----------
 
 class JointDataset(LoadImagesAndLabels):  # for training
@@ -478,7 +501,6 @@ class JointDataset(LoadImagesAndLabels):  # for training
         :param transforms:
         """
         self.opt = opt
-        # dataset_names = paths.keys()
         self.img_files = OrderedDict()
         self.label_files = OrderedDict()
         self.tid_num = OrderedDict()
@@ -496,6 +518,11 @@ class JointDataset(LoadImagesAndLabels):  # for training
         self.width = self.default_input_wh[0]
         self.height = self.default_input_wh[1]
 
+        # PIL augmentation pipeline — instantiated once, reused per sample.
+        # Replaces apply_weather_light_color + bias_crop + random_affine.
+        self.augment = augment
+        self._pil_aug = build_aerial_mot_transforms() if augment else None
+
         # ----- generate img and label file path lists
         for ds, path in paths.items():
             with open(path, 'r') as file:
@@ -512,10 +539,9 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
         if opt.id_weight > 0:  # If do ReID calculation
             # @even: for MCMOT training
-            for ds, label_paths in self.label_files.items():  # 每个子数据集
+            for ds, label_paths in self.label_files.items():
                 max_ids_dict = defaultdict(int)  # cls_id => max track id
 
-                # 子数据集中每个label
                 for lp in label_paths:
                     if not os.path.isfile(lp):
                         print('[Warning]: invalid label file {}.'.format(lp))
@@ -525,53 +551,49 @@ class JointDataset(LoadImagesAndLabels):  # for training
                         warnings.simplefilter("ignore")
 
                         lb = np.loadtxt(lp)
-                        if len(lb) < 1:  # 空标签文件
+                        if len(lb) < 1:
                             continue
 
                         lb = lb.reshape(-1, 6)
-                        for item in lb:  # label中每一个item(检测目标)
-                            if item[1] > max_ids_dict[int(item[0])]:  # item[0]: cls_id, item[1]: track id
+                        for item in lb:
+                            if item[1] > max_ids_dict[int(item[0])]:
                                 max_ids_dict[int(item[0])] = item[1]
 
                 # track id number
-                self.tid_num[ds] = max_ids_dict  # 每个子数据集按照需要reid的cls_id组织成dict
+                self.tid_num[ds] = max_ids_dict
 
             # @even: for MCMOT training
             self.tid_start_idx_of_cls_ids = defaultdict(dict)
-            last_idx_dict = defaultdict(int)  # 从0开始
-            for k, v in self.tid_num.items():  # 统计每一个子数据集
-                for cls_id, id_num in v.items():  # 统计这个子数据集的每一个类别, v是一个max_ids_dict
+            last_idx_dict = defaultdict(int)
+            for k, v in self.tid_num.items():
+                for cls_id, id_num in v.items():
                     self.tid_start_idx_of_cls_ids[k][cls_id] = last_idx_dict[cls_id]
                     last_idx_dict[cls_id] += id_num
 
             # @even: for MCMOT training
             self.nID_dict = defaultdict(int)
             for k, v in last_idx_dict.items():
-                self.nID_dict[k] = int(v)  # 每个类别的tack ids数量
+                self.nID_dict[k] = int(v)
 
-        self.nds = [len(x) for x in self.img_files.values()]  # 每个子训练集(MOT15, MOT20...)的图片数
-        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]  # 当前子数据集前面累计图片总数?
-        self.nF = sum(self.nds)  # 用于训练的所有子训练集的图片总数
-        self.max_objs = opt.K  # 每张图最多检测跟踪的目标个数
-        self.augment = augment
+        self.nds = [len(x) for x in self.img_files.values()]
+        self.cds = [sum(self.nds[:i]) for i in range(len(self.nds))]
+        self.nF = sum(self.nds)
+        self.max_objs = opt.K
         self.transforms = transforms
 
         print('dataset summary')
         print(self.tid_num)
 
-        if opt.id_weight > 0:  # If do ReID calculation
-            # print('total # identities:', self.nID)
+        if opt.id_weight > 0:
             for k, v in self.nID_dict.items():
                 print('Total {:d} IDs of {}'.format(v, id2cls[k]))
 
-            # print('start index', self.tid_start_index)
             for k, v in self.tid_start_idx_of_cls_ids.items():
                 for cls_id, start_idx in v.items():
                     print('Start index of dataset {} class {:d} is {:d}'
                           .format(k, int(cls_id), int(start_idx)))
 
     def __getitem__(self, idx):
-        # 为子训练集计算起始index
         for i, c in enumerate(self.cds):
             if idx >= c:
                 ds = list(self.label_files.keys())[i]
@@ -582,10 +604,8 @@ class JointDataset(LoadImagesAndLabels):  # for training
 
         # Get image data and label
         imgs, labels, img_path, (input_h, input_w) = self.get_data(img_path, label_path)
-        # print('input_h, input_w: %d %d' % (input_h, input_w))
 
-        # 存在多个子训练集时, 为每个子训练集合(视频seq)计算正确的起始index
-        # @even: for MCMOT training
+        # @even: for MCMOT training — remap track ids per sub-dataset
         if self.opt.id_weight > 0:
             for i, _ in enumerate(labels):
                 if labels[i, 1] > -1:
@@ -593,44 +613,36 @@ class JointDataset(LoadImagesAndLabels):  # for training
                     start_idx = self.tid_start_idx_of_cls_ids[ds][cls_id]
                     labels[i, 1] += start_idx
 
-        output_h = imgs.shape[1] // self.opt.down_ratio  # 向下取整除法
+        output_h = imgs.shape[1] // self.opt.down_ratio
         output_w = imgs.shape[2] // self.opt.down_ratio
-        # print('output_h, output_w: %d %d' % (output_h, output_w))
 
-        # num_classes = self.num_classes
-
-        # 图片中实际标注的目标数
         num_objs = labels.shape[0]
 
         # --- GT of detection
-        hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)  # C×H×W: heat-map通道数即类别数
+        hm = np.zeros((self.num_classes, output_h, output_w), dtype=np.float32)
         wh = np.zeros((self.max_objs, 2), dtype=np.float32)
         reg = np.zeros((self.max_objs, 2), dtype=np.float32)
-        ind = np.zeros((self.max_objs,), dtype=np.int64)  # K个object
-        reg_mask = np.zeros((self.max_objs,), dtype=np.uint8)  # 只计算feature map有目标的像素的reg loss
+        ind = np.zeros((self.max_objs,), dtype=np.int64)
+        reg_mask = np.zeros((self.max_objs,), dtype=np.uint8)
 
         if self.opt.id_weight > 0:
             # --- GT of ReID
-            ids = np.zeros((self.max_objs,), dtype=np.int64)  # 一张图最多检测并ReID K个目标, 都初始化id为0
+            ids = np.zeros((self.max_objs,), dtype=np.int64)
 
-            # @even: 每个目标类别都对应一组track ids
+            # @even: each class has its own track-id map
             cls_tr_ids = np.zeros((self.num_classes, output_h, output_w), dtype=np.int64)
 
-            # @even, class id map: 每个(x, y)处的目标类别, 都初始化为-1
-            cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)  # 1×H×W
+            # @even, class id map
+            cls_id_map = np.full((1, output_h, output_w), -1, dtype=np.int64)
 
         # Gauss function definition
         draw_gaussian = draw_msra_gaussian if self.opt.mse_loss else draw_umich_gaussian
 
-        # 遍历每一个ground truth检测目标
-        for k in range(num_objs):  # 图片中实际的目标个数
+        for k in range(num_objs):
             label = labels[k]
 
-            # 计算bbox的经过网络的输出GT值
-            #                       0        1        2       3
             bbox = label[2:]  # center_x, center_y, bbox_w, bbox_h
 
-            # 检测目标的类别(索引从0开始, 0代表背景类别)
             cls_id = int(label[0])
 
             bbox[[0, 2]] = bbox[[0, 2]] * output_w
@@ -643,35 +655,31 @@ class JointDataset(LoadImagesAndLabels):  # for training
             if h > 0 and w > 0:
                 # heat-map radius
                 radius = gaussian_radius((math.ceil(h), math.ceil(w)))
-                radius = max(0, int(radius))  # radius >= 0
+                radius = max(0, int(radius))
                 radius = self.opt.hm_gauss if self.opt.mse_loss else radius
 
                 # bbox center coordinate
                 ct = np.array([bbox[0], bbox[1]], dtype=np.float32)
-                ct_int = ct.astype(np.int32)  # floor int
+                ct_int = ct.astype(np.int32)
 
                 # draw gauss weight for heat-map
-                draw_gaussian(hm[cls_id], ct_int, radius)  # hm
+                draw_gaussian(hm[cls_id], ct_int, radius)
 
                 # --- GT of detection
                 wh[k] = float(w), float(h)
 
-                # 记录feature map上有目标的坐标索引
-                ind[k] = ct_int[1] * output_w + ct_int[0]  # feature map index:y*w+x
+                ind[k] = ct_int[1] * output_w + ct_int[0]
 
-                # offset regression
                 reg[k] = ct - ct_int
                 reg_mask[k] = 1
 
                 # --- GT of ReID
                 if self.opt.id_weight > 0:
-                    # @even: 取output feature map的每个(y, x)处的目标类别
-                    cls_id_map[0][ct_int[1], ct_int[0]] = cls_id  # 1×H×W
+                    cls_id_map[0][ct_int[1], ct_int[0]] = cls_id
 
-                    # @even: 记录该类别对应的track ids
-                    cls_tr_ids[cls_id][ct_int[1]][ct_int[0]] = label[1] - 1  # track id从1开始的, 转换成从0开始
+                    cls_tr_ids[cls_id][ct_int[1]][ct_int[0]] = label[1] - 1
 
-                    ids[k] = label[1] - 1  # 分类的idx: track id - 1
+                    ids[k] = label[1] - 1
 
         if self.opt.id_weight > 0:
             ret = {'input': imgs,
@@ -681,7 +689,7 @@ class JointDataset(LoadImagesAndLabels):  # for training
                    'ind': ind,
                    'reg_mask': reg_mask,
                    'ids': ids,
-                   'cls_id_map': cls_id_map,  # feature map上每个(x, y)处的目标类别id
+                   'cls_id_map': cls_id_map,
                    'cls_tr_ids': cls_tr_ids}
         else:  # only for detection
             ret = {'input': imgs,
@@ -691,5 +699,4 @@ class JointDataset(LoadImagesAndLabels):  # for training
                    'ind': ind,
                    'reg_mask': reg_mask}
 
-        return ret  # 返回一个字典(第一次见识这样的getitem)
-
+        return ret

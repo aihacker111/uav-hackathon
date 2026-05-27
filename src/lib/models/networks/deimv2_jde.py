@@ -381,7 +381,7 @@ def get_deimv2_jde(
     head_bottleneck: int = 64,       # bottleneck channels in InvertedBottleneckHead
     deimv2_pretrained: str = None,   # path to DEIMv2 COCO .pth checkpoint
     vit_weights_path: str = None,    # path to vitt_distill.pt (ViT-Tiny backbone)
-    freeze_backbone: bool = True,    # freeze backbone+encoder during head warm-up
+    freeze_backbone: bool = False,   # False = end-to-end fine-tuning (recommended)
 ):
     """
     Build DEIMv2-JDE model and optionally load DEIMv2 COCO pretrained weights.

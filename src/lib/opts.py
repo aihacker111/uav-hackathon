@@ -88,6 +88,21 @@ class opts(object):
                                  default='',
                                  help='Path to ViT-Tiny backbone checkpoint (e.g. vitt_distill.pt). '
                                       'Used only when --arch=deimv2 and --deimv2_pretrained is not set.')
+        # DEIMv2-specific: whether to freeze backbone+encoder after loading pretrained weights.
+        # False (default) = end-to-end fine-tuning; True = only train neck+heads (faster warm-up).
+        self.parser.add_argument('--freeze_backbone',
+                                 action='store_true',
+                                 default=False,
+                                 help='Freeze DEIMv2 backbone+encoder after loading pretrained weights. '
+                                      'Default False = train all layers end-to-end.')
+        # DEIMv2-specific: LR multiplier for backbone+encoder relative to heads.
+        # E.g. --backbone_lr_scale 0.1 means backbone LR = 0.1 × base LR.
+        self.parser.add_argument('--backbone_lr_scale',
+                                 type=float,
+                                 default=0.1,
+                                 help='LR scale for backbone+encoder params (vs heads). '
+                                      'Only used when --freeze_backbone is False and arch=deimv2. '
+                                      'Default 0.1 protects pretrained features from large updates.')
         
         self.parser.add_argument('--seg_feat_channel', default=8, type=int, help='.')
         
@@ -265,8 +280,8 @@ class opts(object):
                                  help='feature dim for reid')
         self.parser.add_argument('--input-wh',
                                  type=tuple,
-                                 default=(1088, 608),  # (768, 448) or (1088, 608)
-                                 help='net input resplution')
+                                 default=(864, 480),  # (1088,608) full | (864,480) ~20% faster | (768,448) ~30% faster
+                                 help='net input resolution. Both W and H must be divisible by 32.')
 
         # ----------------------1~10 object classes are what we need
         # pedestrian      (1),  --> 0

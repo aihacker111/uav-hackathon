@@ -74,10 +74,32 @@ def run(opt):
             extra_kwargs['deimv2_pretrained'] = opt.deimv2_pretrained
         if getattr(opt, 'vit_weights_path', ''):
             extra_kwargs['vit_weights_path'] = opt.vit_weights_path
+        # Pass freeze flag — default False means end-to-end fine-tuning
+        extra_kwargs['freeze_backbone'] = getattr(opt, 'freeze_backbone', False)
     model = create_model(opt.arch, opt.heads, opt.head_conv, **extra_kwargs)
 
-    # 初始化优化器
-    optimizer = torch.optim.Adam(model.parameters(), opt.lr)
+    # ---- Optimizer với differential LR (chỉ cho DEIMv2 khi không freeze) ----
+    # Backbone+encoder dùng LR nhỏ hơn để bảo vệ pretrained features.
+    # Heads dùng full LR để học nhanh các task mới (detection + ReID).
+    if (opt.arch.startswith('deimv2')
+            and not getattr(opt, 'freeze_backbone', False)
+            and getattr(opt, 'backbone_lr_scale', 1.0) != 1.0):
+        backbone_params, head_params = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith('backbone.') or name.startswith('encoder.'):
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+        optimizer = torch.optim.Adam([
+            {'params': backbone_params, 'lr': opt.lr * opt.backbone_lr_scale},
+            {'params': head_params,     'lr': opt.lr},
+        ], lr=opt.lr)
+        print(f'Differential LR: backbone×{opt.backbone_lr_scale} ({len(backbone_params)} params), '
+              f'heads×1.0 ({len(head_params)} params)')
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), opt.lr)
 
     start_epoch = 0
     if opt.load_model != '':
@@ -89,20 +111,17 @@ def run(opt):
                                                    opt.lr_step)
 
     # Get dataloader
-    if opt.is_debug:
+    # num_workers: số worker process để load data song song với GPU training.
+    # Rule of thumb: 2–4 × số GPU. Dùng 0 khi debug để dễ trace lỗi.
+    _nw = 0 if opt.is_debug else min(8, os.cpu_count() or 4)
 
-        train_loader = torch.utils.data.DataLoader(dataset=dataset,
-                                                   batch_size=opt.batch_size,
-                                                   shuffle=True,
-                                                   pin_memory=True,
-                                                   drop_last=True)  # debug时不设置线程数(即默认为0)
-    else:
-
-        train_loader = torch.utils.data.DataLoader(dataset=dataset,
-                                                   batch_size=opt.batch_size,
-                                                   shuffle=True,
-                                                   pin_memory=True,
-                                                   drop_last=True)  # debug时不设置线程数(即默认为0)
+    train_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                               batch_size=opt.batch_size,
+                                               shuffle=True,
+                                               num_workers=_nw,
+                                               pin_memory=True,
+                                               persistent_workers=(_nw > 0),
+                                               drop_last=True)
 
     print('Starting training...')
     Trainer = train_factory[opt.task]
