@@ -16,7 +16,10 @@ class ModleWithLoss(torch.nn.Module):
 
     def forward(self, batch):
         # 前向推理, 获取网络网络输出
-        outputs = self.model.forward(batch['pre_input'], batch['input'])
+        if 'pre_input' in batch:
+            outputs = self.model.forward(batch['pre_input'], batch['input'])
+        else:
+            outputs = self.model.forward(batch['input'])
 
         # 根据网络输出和ground truth计算loss
         loss, loss_stats = self.loss.forward(outputs=outputs, batch=batch)

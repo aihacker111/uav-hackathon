@@ -82,6 +82,12 @@ class opts(object):
                                  default='',
                                  help='Path to DEIMv2 COCO checkpoint for backbone+encoder '
                                       'pre-loading (only used when --arch=deimv2).')
+        # DEIMv2-specific: path to ViT-Tiny backbone weights (vitt_distill.pt)
+        # Used only when --deimv2_pretrained is NOT set, to warm-start the ViT backbone.
+        self.parser.add_argument('--vit_weights_path',
+                                 default='',
+                                 help='Path to ViT-Tiny backbone checkpoint (e.g. vitt_distill.pt). '
+                                      'Used only when --arch=deimv2 and --deimv2_pretrained is not set.')
         
         self.parser.add_argument('--seg_feat_channel', default=8, type=int, help='.')
         

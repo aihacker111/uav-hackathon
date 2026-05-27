@@ -61,8 +61,11 @@ def run(opt):
     # For DEIMv2, pass the COCO pretrained path so backbone+encoder are loaded.
     # For all other archs, behaviour is unchanged.
     extra_kwargs = {}
-    if opt.arch.startswith('deimv2') and getattr(opt, 'deimv2_pretrained', ''):
-        extra_kwargs['deimv2_pretrained'] = opt.deimv2_pretrained
+    if opt.arch.startswith('deimv2'):
+        if getattr(opt, 'deimv2_pretrained', ''):
+            extra_kwargs['deimv2_pretrained'] = opt.deimv2_pretrained
+        if getattr(opt, 'vit_weights_path', ''):
+            extra_kwargs['vit_weights_path'] = opt.vit_weights_path
     model = create_model(opt.arch, opt.heads, opt.head_conv, **extra_kwargs)
 
     # 初始化优化器

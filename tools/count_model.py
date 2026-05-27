@@ -168,7 +168,7 @@ def parse_args():
                    help="Number of detection classes (VisDrone=5, UAVDT=5, etc.)")
     p.add_argument("--reid-dim",    type=int,   default=128,
                    help="ReID embedding dimension")
-    p.add_argument("--head-conv",   type=int,   default=64,
+    p.add_argument("--head-conv",   type=int,   default=256,
                    help="Intermediate channels in CenterNet heads")
     p.add_argument("--weights",     type=str,   default="",
                    help="Optional path to a checkpoint to load before counting")
