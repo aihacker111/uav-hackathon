@@ -22,6 +22,10 @@ from lib.datasets.uav_augment import apply_weather_light_color, bias_crop as _bi
 from lib.utils.utils import xyxy2xywh, generate_anchors, xywh2xyxy, encode_delta
 from lib.tracker.multitracker import id2cls
 
+# ImageNet mean/std (CxHxW, float32) — must match the Normalize() used in train.py.
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+_IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+
 
 # for inference
 class LoadImages:
@@ -69,10 +73,11 @@ class LoadImages:
         # Padded resize
         img, _, _, _ = letterbox(img_0, height=self.height, width=self.width)
 
-        # Normalize RGB
+        # Normalize RGB — must match train.py: /255 then ImageNet mean/std
         img = img[:, :, ::-1].transpose(2, 0, 1)
         img = np.ascontiguousarray(img, dtype=np.float32)
         img /= 255.0
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
 
         # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
         return img_path, img, img_0
@@ -88,10 +93,11 @@ class LoadImages:
         # Padded resize
         img, _, _, _ = letterbox(img_0, height=self.height, width=self.width)
 
-        # Normalize RGB: BGR -> RGB and H×W×C -> C×H×W
+        # Normalize RGB: BGR -> RGB and H×W×C -> C×H×W, then ImageNet mean/std
         img = img[:, :, ::-1].transpose(2, 0, 1)
         img = np.ascontiguousarray(img, dtype=np.float32)
         img /= 255.0
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
 
         return img_path, img, img_0
 
@@ -142,10 +148,11 @@ class LoadVideo:  # for inference
         # Padded resize
         img, _, _, _ = letterbox(img_0, height=self.height, width=self.width)
 
-        # Normalize RGB
+        # Normalize RGB — must match train.py: /255 then ImageNet mean/std
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR->RGB and HWC->CHW
         img = np.ascontiguousarray(img, dtype=np.float32)
         img /= 255.0
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
 
         # save letterbox image
         # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])
